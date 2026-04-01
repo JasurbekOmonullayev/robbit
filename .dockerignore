@@ -1,0 +1,12 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.sync_state.json
+Jiddi_lead.xlsx
+*.xlsx
+.git/
+.gitignore
+.vscode/
+.idea/
