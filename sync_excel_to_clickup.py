@@ -19,6 +19,7 @@ DEFAULT_LEADS_SHEET = "Leads"
 DEFAULT_MAPPING_SHEET = "columns"
 LEAD_COLUMN_NAME = "2. Lead ID"
 TASK_NAME_COLUMN = "3. Ismingizni kiriting!"
+NEW_TASK_STATUS = "yangi lead"
 MAPPING_SOURCE_HEADER = "sheets_columns_name"
 MAPPING_CLICKUP_ID_HEADER = "clickup_column_id"
 DEFAULT_STATE_FILE = ".sync_state.json"
@@ -363,11 +364,10 @@ def build_rows(
 
     for rec in lead_records:
         lead = canonical_lead_id(rec.get(LEAD_COLUMN_NAME))
-        if not lead:
+        if lead and lead in seen_in_source:
             continue
-        if lead in seen_in_source:
-            continue
-        seen_in_source.add(lead)
+        if lead:
+            seen_in_source.add(lead)
 
         raw_name = normalize_text(rec.get(TASK_NAME_COLUMN))
         task_name = raw_name if raw_name else f"Lead {lead}"
@@ -411,7 +411,6 @@ def main() -> int:
 
     leads_sheet_name = os.getenv("GOOGLE_LEADS_SHEET_NAME", DEFAULT_LEADS_SHEET).strip() or DEFAULT_LEADS_SHEET
     mapping_sheet_name = os.getenv("GOOGLE_MAPPING_SHEET_NAME", DEFAULT_MAPPING_SHEET).strip() or DEFAULT_MAPPING_SHEET
-    state_file = Path(os.getenv("SYNC_STATE_FILE", DEFAULT_STATE_FILE).strip() or DEFAULT_STATE_FILE)
 
     if not token:
         print("ERROR: CLICKUP_API_TOKEN topilmadi")
@@ -464,26 +463,49 @@ def main() -> int:
 
     rows = build_rows(lead_records, mapping, field_meta_by_id)
     clickup_existing = extract_existing_leads(tasks, lead_field_id)
-    local_existing = load_local_state_ids(state_file)
-    existing_leads = clickup_existing | local_existing
+    # ClickUp source-of-truth: dedupe faqat ClickUp'dagi real Lead IDlar bo'yicha qilinadi.
+    existing_leads = set(clickup_existing)
 
     created = 0
-    skipped = 0
+    skipped_existing = 0
+    skipped_missing_lead_in_sheet = 0
+    skipped_missing_lead_in_payload = 0
     errors = 0
 
     process_count = 0
     for row in rows:
         lead_id = row["lead_id"]
 
+        # Faqat yangi yaratilayotgan tasklar uchun Lead ID majburiy:
+        # bo'sh bo'lsa create qilinmaydi, lekin run davom etadi.
+        if not lead_id:
+            skipped_missing_lead_in_sheet += 1
+            print("SKIP: Sheets qatorida Lead ID yo'q, task create qilinmadi.")
+            continue
+
         if lead_id in existing_leads:
-            skipped += 1
+            skipped_existing += 1
             continue
 
         if args.limit and process_count >= args.limit:
             break
 
+        lead_field_present = False
+        for cf in row["custom_fields"]:
+            if normalize_text(cf.get("id")) == lead_field_id and normalize_text(cf.get("value")):
+                lead_field_present = True
+                break
+        if not lead_field_present:
+            skipped_missing_lead_in_payload += 1
+            print(
+                f"SKIP: lead_id={lead_id} uchun Lead ID custom field payloadga tushmadi, "
+                "task create qilinmadi."
+            )
+            continue
+
         payload = {
             "name": row["task_name"],
+            "status": NEW_TASK_STATUS,
             "custom_fields": row["custom_fields"],
         }
 
@@ -498,7 +520,6 @@ def main() -> int:
             client.create_task(list_id=list_id, payload=payload)
             created += 1
             existing_leads.add(lead_id)
-            local_existing.add(lead_id)
             process_count += 1
             print(f"CREATED: lead_id={lead_id}")
         except Exception as exc:  # noqa: BLE001
@@ -507,12 +528,13 @@ def main() -> int:
 
     print("--- SUMMARY ---")
     print(f"source_rows_prepared={len(rows)}")
-    print(f"existing_in_clickup={len(tasks)} tasks, {len(existing_leads)} unique_lead_ids_after_run")
+    print(f"clickup_existing_tasks={len(tasks)}")
+    print(f"clickup_existing_lead_ids={len(clickup_existing)}")
     print(f"created={created}")
-    print(f"skipped_existing={skipped}")
+    print(f"skipped_existing={skipped_existing}")
+    print(f"skipped_missing_lead_in_sheet={skipped_missing_lead_in_sheet}")
+    print(f"skipped_missing_lead_in_payload={skipped_missing_lead_in_payload}")
     print(f"errors={errors}")
-    if not args.dry_run:
-        save_local_state_ids(state_file, local_existing)
     return 0 if errors == 0 else 2
 
 
